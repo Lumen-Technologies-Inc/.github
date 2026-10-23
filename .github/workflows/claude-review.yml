@@ -15,10 +15,13 @@ concurrency:
   cancel-in-progress: true
 jobs:
   review:
-    # Skip drafts, Dependabot and fork pull requests (untrusted code, no secrets).
+    # Skip drafts, Dependabot, the agent account (the founder reviews its pull requests) and fork
+    # pull requests (untrusted code, no secrets). A skipped run counts as passing for the
+    # required check; the ruleset still requires the founder's approval.
     if: >-
       github.event.pull_request.draft == false &&
       github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.user.login != 'lmn-agent' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 15
