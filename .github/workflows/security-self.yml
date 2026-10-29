@@ -1,0 +1,13 @@
+# This repository's own security check, through the reusable workflow in the same commit.
+name: security
+on:
+  pull_request:
+  schedule:
+    - cron: "17 9 * * 1" # Mondays, 09:17 UTC
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  security:
+    uses: ./.github/workflows/security.yml
