@@ -1,0 +1,219 @@
+# Reusable security check, called by .github/workflows/security.yml in each repository. Free tools
+# only: on private repositories GitHub's secret scanning and code scanning are paid add-ons.
+#   dependencies  npm audit of the production dependencies fails on a high or critical finding;
+#                 OSV-Scanner lists known vulnerabilities in every lockfile (npm, pip, ...) and
+#                 fails nothing, so a dev tool's advisory never blocks a merge.
+#   secrets       TruffleHog over the pull request's commits (the whole history on the weekly run)
+#                 fails on any finding. No verification: found credentials are never sent to their
+#                 providers. Only the detector, file, line and commit are printed, never the value
+#                 (this repository is public and so are its logs). A repository can list paths to
+#                 skip, one regular expression per line, in .trufflehog-exclude.
+#   report        weekly and manual runs only: opens or updates one issue, "Security check", with
+#                 everything found, and closes it when a run finds nothing.
+# Pinned: actions/checkout v7.0.1, actions/setup-node v7.1.0, actions/upload-artifact v7.0.2,
+# actions/download-artifact v8.0.2; osv-scanner v2.7.0 and trufflehog v3.99.7, both downloaded from
+# their GitHub releases and checked against the published SHA-256.
+name: security
+on:
+  workflow_call:
+permissions:
+  contents: read
+env:
+  OSV_VERSION: v2.7.0
+  OSV_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+  TRUFFLEHOG_VERSION: 3.99.7
+  TRUFFLEHOG_SHA256: bdbea0508e439b144f49de14e775908de5f902f3d14ea7ae8354bae72b0b72ef
+jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: hashFiles('**/package-lock.json') != ''
+        with:
+          node-version: 22
+      - name: Install OSV-Scanner
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/osv-scanner" "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SHA256}  $RUNNER_TEMP/osv-scanner" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+      - name: npm audit, production dependencies
+        id: audit
+        if: hashFiles('**/package-lock.json') != ''
+        run: |
+          mkdir -p report
+          failed=0
+          {
+            echo "### npm audit"
+            echo
+          } > report/npm.md
+          # Every lockfile outside node_modules; each is audited from its own directory.
+          while IFS= read -r lock; do
+            dir=$(dirname "$lock")
+            prod=$(cd "$dir" && npm audit --omit=dev --package-lock-only --json || true)
+            all=$(cd "$dir" && npm audit --package-lock-only --json || true)
+            high=$(jq '(.metadata.vulnerabilities.high // 0) + (.metadata.vulnerabilities.critical // 0)' <<<"$prod")
+            [ "$high" -gt 0 ] && failed=1
+            {
+              echo "**\`$lock\`**: $high high or critical in production dependencies."
+              echo
+              if [ "$(jq '.vulnerabilities | length' <<<"$all")" -gt 0 ]; then
+                echo "| Package | Severity | Production | Fix available |"
+                echo "|---|---|---|---|"
+                jq -r --argjson prod "$(jq '.vulnerabilities // {} | keys' <<<"$prod")" '
+                  .vulnerabilities | to_entries[] |
+                  "| \(.key) | \(.value.severity) | \(if (.key as $k | $prod | index($k)) then "yes" else "no (dev)" end) | \(if .value.fixAvailable then "yes" else "no" end) |"' <<<"$all"
+              else
+                echo "No known vulnerabilities."
+              fi
+              echo
+            } >> report/npm.md
+          done < <(find . -name package-lock.json -not -path '*/node_modules/*' | sort)
+          cat report/npm.md >> "$GITHUB_STEP_SUMMARY"
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+      - name: OSV-Scanner, every lockfile (listed, never fails)
+        run: |
+          mkdir -p report
+          set +e
+          "$RUNNER_TEMP/osv-scanner" scan source --recursive --format json --output "$RUNNER_TEMP/osv.json" . > /dev/null
+          code=$?
+          set -e
+          {
+            echo "### OSV-Scanner"
+            echo
+            if [ "$code" -eq 128 ]; then
+              echo "No lockfile to scan."
+            elif [ "$code" -gt 1 ]; then
+              echo "OSV-Scanner failed (exit $code)."
+            elif [ "$(jq '[.results[]?.packages[]?] | length' "$RUNNER_TEMP/osv.json")" -eq 0 ]; then
+              echo "No known vulnerabilities."
+            else
+              echo "| Lockfile | Package | Advisories | Highest CVSS |"
+              echo "|---|---|---|---|"
+              jq -r '.results[] | (.source.path | ltrimstr(env.GITHUB_WORKSPACE + "/")) as $src | .packages[] |
+                "| \($src) | \(.package.name)@\(.package.version) | \([.groups[].ids[0]] | join(", ")) | \([.groups[].max_severity | select(. != "") | tonumber] | max // "unknown") |"' "$RUNNER_TEMP/osv.json"
+            fi
+            echo
+          } > report/osv.md
+          cat report/osv.md >> "$GITHUB_STEP_SUMMARY"
+          [ "$code" -le 1 ] || [ "$code" -eq 128 ]
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: security-dependencies
+          path: report/
+          if-no-files-found: ignore
+      - name: Fail on high or critical production advisories
+        if: steps.audit.outputs.failed == '1'
+        run: |
+          echo "::error::npm audit found high or critical vulnerabilities in production dependencies (see the summary)."
+          exit 1
+
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install TruffleHog
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/th.tgz" "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz"
+          echo "${TRUFFLEHOG_SHA256}  $RUNNER_TEMP/th.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/th.tgz" -C "$RUNNER_TEMP" trufflehog
+      - name: TruffleHog (detector, file, line and commit only)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          mkdir -p report
+          args=(git "file://$PWD" --no-verification --no-update --json --branch "$HEAD")
+          # A pull request: its own commits. Otherwise: the whole history.
+          [ -n "$BASE" ] && args+=(--since-commit "$BASE")
+          [ -f .trufflehog-exclude ] && args+=(--exclude-paths .trufflehog-exclude)
+          set +e
+          "$RUNNER_TEMP/trufflehog" "${args[@]}" 2> "$RUNNER_TEMP/th.log" \
+            | jq -r 'select(.DetectorName) | [.DetectorName, (.SourceMetadata.Data.Git.file // "?"), (.SourceMetadata.Data.Git.line // 0 | tostring), (.SourceMetadata.Data.Git.commit // "?")[0:7]] | @tsv' \
+            | sort -u > "$RUNNER_TEMP/found.tsv"
+          code=${PIPESTATUS[0]}
+          set -e
+          [ "$code" -ne 0 ] && tail -n 20 "$RUNNER_TEMP/th.log"
+          {
+            echo "### Secrets (TruffleHog, $([ -n "$BASE" ] && echo "this pull request's commits" || echo "the whole history"))"
+            echo
+            if [ "$code" -ne 0 ]; then
+              echo "TruffleHog failed (exit $code)."
+            elif [ -s "$RUNNER_TEMP/found.tsv" ]; then
+              echo "| Detector | File | Line | Commit |"
+              echo "|---|---|---|---|"
+              awk -F'\t' '{ printf "| %s | `%s` | %s | %s |\n", $1, $2, $3, $4 }' "$RUNNER_TEMP/found.tsv"
+            else
+              echo "Nothing found."
+            fi
+            echo
+          } > report/secrets.md
+          cat report/secrets.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -ne 0 ] || [ -s "$RUNNER_TEMP/found.tsv" ]; then
+            echo "::error::TruffleHog found possible secrets or failed (see the summary). Rotate a real secret before anything else."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: security-secrets
+          path: report/
+          if-no-files-found: ignore
+
+  report:
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    needs: [dependencies, secrets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: security-*
+          merge-multiple: true
+          path: report
+      - name: Open, update or close the "Security check" issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DEPENDENCIES: ${{ needs.dependencies.result }}
+          SECRETS: ${{ needs.secrets.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Security check"
+          issue=$(gh issue list --state open --search "in:title \"$title\"" --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
+          # Something to act on: a failed job, or any finding listed (dev advisories included).
+          if [ "$DEPENDENCIES" = success ] && [ "$SECRETS" = success ] \
+             && ! grep -qh '^| ' report/*.md 2>/dev/null; then
+            if [ -n "$issue" ]; then
+              gh issue comment "$issue" --body "Clean on $(date -u +%F): nothing found ($RUN_URL)."
+              gh issue close "$issue"
+            fi
+            exit 0
+          fi
+          {
+            echo "Weekly security check, $(date -u +%F): dependencies **$DEPENDENCIES**, secrets **$SECRETS**. [Run]($RUN_URL)"
+            echo
+            cat report/*.md 2>/dev/null || echo "No report was produced; see the run."
+          } > body.md
+          gh label create security --color B60205 --description "Security check findings" --force > /dev/null
+          if [ -n "$issue" ]; then
+            gh issue edit "$issue" --body-file body.md
+            gh issue comment "$issue" --body "Updated on $(date -u +%F) ($RUN_URL)."
+          else
+            gh issue create --title "$title" --label security --body-file body.md
+          fi
