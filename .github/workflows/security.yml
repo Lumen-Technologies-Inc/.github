@@ -36,7 +36,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: hashFiles('**/package-lock.json') != ''
         with:
-          node-version: 22
+          node-version: 26
       - name: Install OSV-Scanner
         run: |
           curl -fsSL -o "$RUNNER_TEMP/osv-scanner" "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
